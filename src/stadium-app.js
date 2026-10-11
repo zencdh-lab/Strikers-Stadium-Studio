@@ -4,14 +4,17 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { zipSync } from 'fflate';
+import { zipSync, unzipSync } from 'fflate';
 import { boneNames, readTextures, decodeTex, texHeader, encodePng, decodePng, loadShier, hex8, nlHash } from './formats.js';
 import { exportGlb } from './export.js';
 import { reencodeBundle } from './import.js';
 import { parseWorld, exportStadiumGlb, rebuildTmp, packZlib, findPitch, stitchPitch, splitPitch, parseRes, readIfl } from './stadium.js';
 import { loadAnims, sample, sampleRoot } from './anim.js';
 import { parseIni, iniGet, iniSet } from './ini.js';
-import { parseScene, worldMatrix, KIND, setMatrix, getPlace, withPlace, copyProp, freeName } from './scene.js';
+import { parseScene, worldMatrix, KIND, setMatrix, getPlace, withPlace, copyProp, freeName, removeProps } from './scene.js';
+import { propKinds, addProp, addTextures } from './propimport.js';
+import { importStadium, SIZE_LIMIT } from './stadiumimport.js';
+import { GLB } from './import.js';
 import { unpackZlib } from './stadium.js';
 
 const $ = (id) => document.getElementById(id);
@@ -58,25 +61,27 @@ async function openStadium(id) {
     const origZ = await readFile(tmpPath);
     const orig = parseWorld(origZ, game.names);
     const res = has(resPath) ? parseRes(await readFile(resPath)) : { skeletons: [], objects: 0 };
-    cur = { id, tmpPath, resPath, origZ, orig, res, view: 'work', cam: 'tv', sel: null };
-    if (has(resPath)) { cur.origRes = unpackZlib(await readFile(resPath)); cur.resWork = edits.has(resPath) ? unpackZlib(edits.get(resPath)) : cur.origRes.slice(); cur.origScene = parseScene(cur.origRes, nameOf); cur.scene = parseScene(cur.resWork, nameOf); }
+    cur = { id, tmpPath, resPath, origZ, orig, res, view: 'work', cam: 'tv', sel: null, selSet: new Set(), undo: [], redo: [] };
+    if (has(resPath)) { cur.origRes = unpackZlib(await readFile(resPath)); cur.resWork = edits.has(resPath) ? unpackZlib(edits.get(resPath)) : cur.origRes.slice(); cur.origScene = parseScene(cur.origRes, nameOf); cur.scene = parseScene(cur.resWork, nameOf); if (guessNames(cur.scene, cur.origScene)) cur.scene = parseScene(cur.resWork, nameOf); }
     cur.pitch = orig.textures ? findPitch(orig, game.names) : null;
     await loadWork(); renderSidebar(); $('welcome').hidden = true;
     await refresh(true); renderAll();
   } catch (e) { toast(e.message || String(e), true); console.error(e); }
   finally { busy(false); }
 }
-async function loadWork() { cur.work = edits.has(cur.tmpPath) ? parseWorld(edits.get(cur.tmpPath), game.names) : cur.orig; }
+async function loadWork() { cur.work = edits.has(cur.tmpPath) ? parseWorld(edits.get(cur.tmpPath), nameOf) : cur.orig; }
 const texMap = (w) => new Map(readTextures(w.textures).map((e) => [e.hash, e.blob]));
 async function replaceTextures(changes) {
   const r = reencodeBundle(cur.work.textures, changes, []);
   if (!r.reencoded.length) return 0;
-  const tmp = rebuildTmp(cur.work.tmp, r.out), z = packZlib(tmp);
+  // the new pictures, written in the game's own layout (directory sorted by hash, padding words)
+  const fresh = new Map(readTextures(r.out).map((e) => [e.hash, e.blob])), changed = new Map(r.reencoded.map((x) => [x.hash, fresh.get(x.hash)]));
+  const tmp = rebuildTmp(cur.work.tmp, addTextures(cur.work.textures, changed)), z = packZlib(tmp);
   setEdit(cur.tmpPath, z, null);
   cur.work = parseWorld(z, game.names);
   return r.reencoded.length;
 }
-function resetStadium() { edits.delete(cur.tmpPath); cur.work = cur.orig; if (cur.resPath) { edits.delete(cur.resPath); if (cur.origRes) { cur.resWork = cur.origRes.slice(); cur.scene = parseScene(cur.resWork, nameOf); } } window.onbeforeunload = edits.size ? () => '' : null; }
+function resetStadium() { edits.delete(cur.tmpPath); cur.work = cur.orig; cur.importReport = ''; if (cur.resPath) { edits.delete(cur.resPath); if (cur.origRes) { cur.resWork = cur.origRes.slice(); cur.scene = parseScene(cur.resWork, nameOf); } } window.onbeforeunload = edits.size ? () => '' : null; }
 
 // ------------------------------------------------------------------ 3D view
 const view = {};
@@ -110,7 +115,7 @@ async function refresh(reframe) {
   updateBadge();
 }
 function updateBadge() {
-  const what = [edits.has(cur.tmpPath) && 'repainted', edits.has(cur.resPath) && 'objects moved', (edits.has(iniPath(cur.id)) || (terrainPath(cur.id) && edits.has(terrainPath(cur.id)))) && 'settings changed'].filter(Boolean);
+  const what = [edits.has(cur.tmpPath) && 'new textures or models', edits.has(cur.resPath) && 'objects changed', (edits.has(iniPath(cur.id)) || (terrainPath(cur.id) && edits.has(terrainPath(cur.id)))) && 'settings changed'].filter(Boolean);
   $('badge').hidden = false; $('badge').innerHTML = cur.view === 'orig' ? 'Original stadium' : what.length ? `<span class="warn">●</span> Your version (${what.join(', ')})` : 'Your version (no changes yet)';
 }
 function applyDisplay() {
@@ -153,10 +158,57 @@ function renderStadium() {
     ${props.length ? '<ul class="parts">' + props.map((p) => `<li>${esc(PROPS[p] || p)} <span class="chip">${esc(p)}</span></li>`).join('') + '</ul>' : '<p class="dim">None: a still stadium.</p>'}
     ${goalEvent ? '<div class="box">This stadium has the <b>riot guards</b>: the goal transition where the machines come out (a cutscene, the <code>riotguard</code> prop and the game\'s <code>CrowdRiot</code> code). Only The Vice and The Wastelands have it.</div>' : '<div class="box">No goal event here: like the classic stadiums, goals are the crowd cheering and the replay.</div>'}
     <p class="dim">See where each one is placed, move it, or copy it on the <b>Objects</b> tab.</p>
-    <h2>Take it into Blender</h2>
-    <div class="btns"><button id="expGlb">Export stadium (.glb)</button></div>
-    <p class="dim">For looking at or planning a remodel in Blender. Bringing a remodelled stadium back comes later; repainting works now (Textures tab).</p>`;
+    <h2>Remodel it in Blender</h2>
+    <ol class="steps"><li><b>Export stadium (.glb)</b> and import it in Blender (File &gt; Import &gt; glTF 2.0). Its pieces are named <code>m0_piece…</code>.</li>
+      <li>Delete, keep or add what you like: the pitch and goals the game plays on stay where they are (41.7 × 24.7 m around 0, 0, 0), so keep your stadium around them. Pieces you keep where they are stay exactly as the game had them.</li>
+      <li>Export from Blender as <b>glTF Binary (.glb)</b>, with <b>Data &gt; Mesh &gt; Vertex Color</b> exported (it holds the baked lighting), then <b>Bring it back</b> here.</li></ol>
+    <div class="btns"><button id="expGlb">Export stadium (.glb)</button><button class="primary" id="impGlb">Bring it back (.glb)…</button></div>
+    <div class="set" style="max-width:420px">
+      <label for="impTex">Biggest texture size</label><select id="impTex"><option value="512">512 (sharpest)</option><option value="256">256 (smaller)</option><option value="128">128 (smallest)</option></select>
+      <label for="impLight">Baked light (vertex colours)</label><select id="impLight"><option value="auto">Automatic</option><option value="1">As they are</option><option value="2">Twice as bright (Wii games store half)</option></select>
+    </div>
+    <div id="impReport">${cur.importReport || ''}</div>
+    ${sizeMeter()}`;
   $('expGlb').onclick = () => { const { glb } = exportStadiumGlb({ world: cur.work, names: game.names, only: [0] }); download(`${cur.id}.glb`, glb); };
+  $('impGlb').onclick = () => { const inp = $('glbInput'); inp.value = ''; inp.onchange = () => inp.files[0] && importRemodel(inp.files[0]); inp.click(); };
+}
+// the stadium's size against the biggest the game ships with
+function sizeMeter() {
+  const n = cur.work.tmp.length, pct = Math.min(100, n / SIZE_LIMIT * 100), over = n > SIZE_LIMIT;
+  return `<div class="meter"><div class="dim">Stadium size: <b>${(n / 1e6).toFixed(2)} MB</b> of about ${(SIZE_LIMIT / 1e6).toFixed(2)} MB (the biggest stadium in the game)${over ? ' <span class="warn">: too big, it may not load</span>' : ''}</div><div class="bar"><div style="width:${pct}%;background:${over ? 'var(--bad)' : pct > 90 ? '#e0b050' : 'var(--accent)'}"></div></div></div>`;
+}
+async function decodeGlbImages(u8) {
+  const g = new GLB(u8), out = new Map();
+  for (const [i, im] of (g.j.images || []).entries()) {
+    try {
+      let bytes, mime = im.mimeType || 'image/png';
+      if (im.bufferView != null) bytes = g.view(im.bufferView).raw;
+      else if (im.uri && im.uri.startsWith('data:')) { const b64 = im.uri.split(',')[1]; bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)); mime = im.uri.slice(5, im.uri.indexOf(';')); }
+      else continue;
+      if (bytes[0] === 0x89 && bytes[1] === 0x50) { out.set(i, decodePng(bytes)); continue; }
+      const bmp = await createImageBitmap(new Blob([bytes], { type: mime }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+      const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height; const x = c.getContext('2d'); x.drawImage(bmp, 0, 0);
+      out.set(i, { w: bmp.width, h: bmp.height, px: x.getImageData(0, 0, bmp.width, bmp.height).data });
+    } catch (e) { console.warn('image', i, e); }
+  }
+  return out;
+}
+async function importRemodel(file) {
+  busy('Building the stadium…'); await new Promise((r) => setTimeout(r, 30));
+  try {
+    const glb = new Uint8Array(await file.arrayBuffer()), images = await decodeGlbImages(glb);
+    const light = $('impLight').value;
+    const r = importStadium({ glb, world: cur.work, res: cur.resWork, images, names: new Map([...game.names, ...extraNames]), opts: { stadium: cur.id, maxTexture: +$('impTex').value, brightness: light === 'auto' ? 'auto' : +light } });
+    for (const [h, n] of r.newTextureNames) extraNames.set(h, n);
+    for (const o of r.objects) if (o.name) extraNames.set(o.hash, o.name);
+    pushUndo();
+    const z = packZlib(r.tmp); setEdit(cur.tmpPath, z, null); cur.work = parseWorld(z, nameOf);
+    cur.resWork = r.res; cur.sel = null; cur.selSet = new Set(); commitScene();
+    const s = r.stats;
+    cur.importReport = `<div class="box ${r.tmp.length > SIZE_LIMIT ? 'warn' : 'ok'}"><b>${esc(file.name)}</b> is in: ${s.keptPieces} of the game's pieces kept as they were, ${s.newObjects} new objects (${s.tris.toLocaleString()} triangles, ${s.newTextures} new textures)${s.droppedTextures ? `; ${s.droppedTextures} of the old stadium's textures no longer used were taken out` : ''}.${r.notes.map((n) => `<br><span class="dim">${esc(n)}</span>`).join('')}</div>`;
+    await refresh(); renderAll();
+    toast(r.tmp.length > SIZE_LIMIT ? 'Brought back, but it is bigger than any stadium in the game.' : 'Stadium brought back.');
+  } catch (e) { toast(e.message || String(e), true); console.error(e); } finally { busy(false); }
 }
 
 function texRole(n) {
@@ -164,6 +216,7 @@ function texRole(n) {
   return (r.find(([re]) => re.test(n)) || [0, ''])[1];
 }
 function renderTextures() {
+  try { cur.pitch = cur.work.textures ? findPitch(cur.work, game.names) : null; } catch (e) { cur.pitch = null; }
   const tex = readTextures(cur.work.textures), origTex = texMap(cur.orig);
   let html = '';
   if (cur.pitch) {
@@ -362,32 +415,17 @@ function placeMarks() {
   if (view.marks) { view.scene.remove(view.marks); view.marks.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); }
   view.marks = new THREE.Group(); view.scene.add(view.marks);
   view.marks.visible = $('marks').checked;
+  view.markOf = new Map();
   const sc = sceneFor(); if (!sc) return;
   for (const r of sc.recs) {
     const g = groupOf(r); if (!g || g.id === 'props') continue;
     const obj = new THREE.Mesh(new THREE.OctahedronGeometry(g.id === 'fx' ? 0.35 : 0.6), new THREE.MeshBasicMaterial({ color: MARK_COL[g.id] }));
     obj.matrixAutoUpdate = false; obj.matrix.copy(toView(worldMatrix(sc, r.i))); obj.userData.rec = r.i;
     obj.traverse((o) => { o.userData.rec = r.i; });
-    view.marks.add(obj);
+    view.marks.add(obj); view.markOf.set(r.i, [obj]);
   }
   view.marks.updateMatrixWorld(true);
   showSelection();
-}
-function showSelection() {
-  if (view.selBox) { view.scene.remove(view.selBox); view.selBox = null; }
-  if (cur.sel == null) return;
-  const box = new THREE.Box3();
-  for (const g of (view.propOf && view.propOf.get(cur.sel)) || []) box.expandByObject(g);
-  if (view.marks) for (const m of view.marks.children) if (m.userData.rec === cur.sel) box.expandByObject(m);
-  if (box.isEmpty()) { const r = sceneFor().recs[cur.sel]; if (!r || !r.m) return; const p = new THREE.Vector3(0, 0, 0).applyMatrix4(toView(worldMatrix(sceneFor(), r.i))); box.setFromCenterAndSize(p, new THREE.Vector3(1, 1, 1)); }
-  box.expandByScalar(0.15);
-  view.selBox = new THREE.Box3Helper(box, 0xffee00); view.scene.add(view.selBox);
-}
-function lookAtSel() {
-  if (!view.selBox) return;
-  const c = view.selBox.box.getCenter(new THREE.Vector3()), sz = view.selBox.box.getSize(new THREE.Vector3()).length();
-  const dir = view.camera.position.clone().sub(view.controls.target).normalize();
-  view.controls.target.copy(c); view.camera.position.copy(c.clone().add(dir.multiplyScalar(Math.max(6, sz * 1.6)))); view.controls.update();
 }
 // writes cur.resWork into the mod, re-reads the scene, redraws
 function commitScene() {
@@ -395,92 +433,393 @@ function commitScene() {
   if (bytesEq(cur.resWork, cur.origRes)) edits.delete(cur.resPath);
   cur.scene = parseScene(cur.resWork, nameOf);
   placeProps(); renderSidebar(); renderMod(); updateBadge();
+  if ($('objUndo')) { $('objUndo').disabled = !(cur.undo && cur.undo.length); $('objRedo').disabled = !(cur.redo && cur.redo.length); }
 }
 function renderObjects() {
   const sc = sceneFor();
   if (!sc) { $('pane-objects').innerHTML = '<p class="dim">This stadium has no object list.</p>'; return; }
-  const changed = (r) => { const o = cur.origScene.recs.find((x) => x.hash === r.hash && x.kind === r.kind); return !o || (r.m && o.m && r.m.some((v, k) => Math.abs(v - o.m[k]) > 1e-5)); };
-  let html = `<h2>${esc(STADIUMS[cur.id] || cur.id)}: what's placed where</h2><p class="dim">${sc.count} objects in the stadium's scene. Click one here or in the 3D view to select it, then move it. Positions are in metres: <b>x</b> along the pitch, <b>y</b> across it, <b>z</b> up; the centre spot is 0, 0, 0.</p>`;
-  if (cur.view === 'orig') html += '<div class="box">You\'re looking at the original. Switch to <b>Your version</b> to move things.</div>';
+  const origBy = new Map(cur.origScene.recs.map((o) => [o.kind + ':' + o.hash, o]));
+  const changed = (r) => { const o = origBy.get(r.kind + ':' + r.hash); return !o || (r.m && o.m && r.m.some((v, k) => Math.abs(v - o.m[k]) > 1e-5)); };
+  const edit = cur.view !== 'orig', q = (cur.objFilter || '').trim().toLowerCase();
+  const shown = (r) => !q || (r.name || hex8(r.hash)).toLowerCase().includes(q);
+  let html = `<h2>${esc(STADIUMS[cur.id] || cur.id)}: what's placed where</h2><p class="dim">${sc.count} objects in the stadium's scene. Positions are in metres: <b>x</b> along the pitch, <b>y</b> across it, <b>z</b> up; the centre spot is 0, 0, 0.</p>`;
+  if (!edit) html += '<div class="box">You\'re looking at the original. Switch to <b>Your version</b> to move things.</div>';
+  else html += `<div class="btns objtop"><button class="small" id="objUndo" ${cur.undo && cur.undo.length ? '' : 'disabled'} title="Ctrl+Z">↶ Undo</button><button class="small" id="objRedo" ${cur.redo && cur.redo.length ? '' : 'disabled'} title="Ctrl+Y">↷ Redo</button><input type="text" id="objFilter" placeholder="Find by name…" value="${esc(cur.objFilter || '')}"></div>`;
+  if (edit && edits.has(cur.tmpPath) && (cur.importReport || cur.work.models[0].objects.length !== cur.orig.models[0].objects.length)) html += `<div class="box tips"><b>New stadium?</b> The old stadium's props and crowd spots are still where its stands were. To clear the props: <b>Select all</b> next to Props, then <b>Remove</b>. To fit the crowd spots onto your new stands: <b>Select all</b> next to Crowd spots, then use <b>Spread</b> and <b>z</b> to line them up, and <b>Sit on the stadium</b> to drop each one onto the seats.</div>`;
   html += '<div id="selEditor"></div>';
+  const allBtn = (ids, label) => `<button class="small selall" data-ids="${ids.join(',')}">${label}</button>`;
   for (const g of GROUPS) {
     const list = sc.recs.filter((r) => groupOf(r) === g); if (!list.length) continue;
-    html += `<h2>${esc(g.title)} <span class="chip">${list.length}</span></h2>${g.note ? `<p class="dim">${esc(g.note)}</p>` : ''}<div class="objlist">`;
+    const vis = list.filter(shown); if (!vis.length) continue;
+    html += `<h2>${esc(g.title)} <span class="chip">${list.length}</span> ${allBtn(vis.map((r) => r.i), 'Select all')}</h2>${g.note ? `<p class="dim">${esc(g.note)}</p>` : ''}<div class="objlist">`;
     if (g.id === 'props') {
-      const by = new Map(); for (const r of list) { const k = stem(r.name) || 'prop'; if (!by.has(k)) by.set(k, []); by.get(k).push(r); }
-      for (const [k, rs] of by) html += `<div class="objsub">${esc(k)} <span class="dim">×${rs.length}</span></div>` + rs.map((r) => objBtn(r, changed(r))).join('');
-    } else html += list.map((r) => objBtn(r, changed(r))).join('');
+      const by = new Map(); for (const r of vis) { const k = stem(r.name) || 'prop'; if (!by.has(k)) by.set(k, []); by.get(k).push(r); }
+      for (const [k, rs] of by) html += `<div class="objsub">${esc(k)} <span class="dim">×${rs.length}</span> ${rs.length > 1 ? allBtn(rs.map((r) => r.i), 'select all') : ''}</div>` + rs.map((r) => objBtn(r, changed(r))).join('');
+    } else html += vis.map((r) => objBtn(r, changed(r))).join('');
     html += '</div>';
   }
+  if (edit) html += `<h2>Add a prop from any stadium</h2><p class="dim">Brings a prop with its model, textures and animation into ${esc(STADIUMS[cur.id] || cur.id)}. It's put over the centre spot, at the height it had in its own stadium (hanging banners stay up); then move it where you want. Some "props" are big groups: Galactic Stadium's asteroids are a whole ring around the stadium.</p>
+    <div class="field"><label>From</label><select id="addFrom">${game.stadiums.map((s) => `<option value="${s}" ${s === (cur.addFrom || cur.id) ? 'selected' : ''}>${esc(STADIUMS[s] || s)}</option>`).join('')}</select></div>
+    <div class="field"><label>Prop</label><select id="addKind"><option>Loading…</option></select></div>
+    <div class="btns"><button class="primary small" id="addBtn" disabled>Add it here</button></div>`;
   $('pane-objects').innerHTML = html;
-  for (const b of $('pane-objects').querySelectorAll('.obj')) b.onclick = () => select(+b.dataset.i, true);
+  for (const b of $('pane-objects').querySelectorAll('.obj')) b.onclick = (e) => { if (e.ctrlKey || e.metaKey || e.shiftKey) toggleSel(+b.dataset.i); else select(+b.dataset.i, true); };
+  for (const b of $('pane-objects').querySelectorAll('.selall')) b.onclick = (e) => { const ids = b.dataset.ids.split(',').map(Number); setSel(e.ctrlKey || e.metaKey ? [...new Set([...selList(), ...ids])] : ids, null, true); };
+  if ($('objUndo')) { $('objUndo').onclick = undo; $('objRedo').onclick = redo; }
+  if ($('objFilter')) $('objFilter').oninput = (e) => { cur.objFilter = e.target.value; const pos = e.target.selectionStart; renderObjects(); const f = $('objFilter'); f.focus(); f.setSelectionRange(pos, pos); };
   renderSelEditor();
+  if ($('addFrom')) { $('addFrom').onchange = (e) => { cur.addFrom = e.target.value; fillKinds(); }; fillKinds(); $('addBtn').onclick = addFromStadium; }
 }
-const objBtn = (r, ch) => `<button class="obj ${cur.sel === r.i ? 'on' : ''} ${ch ? 'changed' : ''}" data-i="${r.i}" title="${esc(r.name || '')}">${esc((r.name || hex8(r.hash)).replace(/^.*\//, ''))}${ch ? ' ●' : ''}</button>`;
-function select(i, frame) {
-  cur.sel = i; showSelection(); if (frame) lookAtSel();
-  for (const b of $('pane-objects').querySelectorAll('.obj')) b.classList.toggle('on', +b.dataset.i === i);
-  renderSelEditor();
+// other stadiums' files, read once
+const srcCache = new Map();
+async function sourceStadium(id) {
+  if (id === cur.id) return { world: cur.work, res: cur.resWork, scene: cur.scene };
+  if (!srcCache.has(id)) {
+    const world = parseWorld(await readFile(`art/environments/${id}/gameworld.tmp.zlib`), game.names), res = unpackZlib(await readFile(`art/environments/${id}/gameworld.res.zlib`));
+    srcCache.set(id, { world, res, scene: parseScene(res, nameOf) });
+  }
+  return srcCache.get(id);
 }
-function renderSelEditor() {
-  const el = $('selEditor'); if (!el) return;
-  const sc = sceneFor(), r = cur.sel != null && sc ? sc.recs[cur.sel] : null;
-  if (!r || !r.m) { el.innerHTML = ''; return; }
-  const g = groupOf(r), p = getPlace(r), edit = cur.view !== 'orig';
-  const num = (id, v, step) => `<input type="number" id="${id}" step="${step}" value="${(+v).toFixed(2)}" ${edit ? '' : 'disabled'}>`;
-  el.innerHTML = `<div class="box sel"><b>${esc(r.name || hex8(r.hash))}</b> <span class="chip">${esc(g ? g.title.replace(/s$/, '') : '')}</span>
-    <div class="set">
-      <label for="px">x (along the pitch)</label>${num('px', p.x, 0.25)}
-      <label for="py">y (across)</label>${num('py', p.y, 0.25)}
-      <label for="pz">z (height)</label>${num('pz', p.z, 0.25)}
-      <label for="pt">Turn (degrees)</label>${num('pt', p.turn, 5)}
-    </div>
-    <div class="btns"><button class="small" id="selLook">Look at it</button>${r.kind === KIND.PROXY && edit ? '<button class="small" id="selCopy">Copy this prop</button>' : ''}<button class="small" id="selUndo" ${edit ? '' : 'disabled'}>Put it back</button></div>
-    ${r.kind === KIND.PROXY ? '<p class="dim" style="margin:6px 0 0">A copy is a new prop of the same kind, with its own name, placed 2 m along. New props are an experiment: try them in the game.</p>' : ''}</div>`;
-  $('selLook').onclick = lookAtSel;
-  if (!edit) return;
-  const apply = () => {
-    const v = (id) => +$(id).value; if (['px', 'py', 'pz', 'pt'].some((id) => !isFinite(v(id)))) return;
-    setMatrix(cur.resWork, r, withPlace(r, { x: v('px'), y: v('py'), z: v('pz'), turn: v('pt') }));
-    commitScene(); showSelection(); markChangedObjs();
-  };
-  for (const id of ['px', 'py', 'pz', 'pt']) $(id).onchange = apply;
-  $('selUndo').onclick = () => {
-    const o = cur.origScene.recs.find((x) => x.hash === r.hash && x.kind === r.kind);
-    if (!o) { toast('This is a new prop: to remove it, use "Start over" on Make mod (or undo this stadium\'s objects).', true); return; }
-    setMatrix(cur.resWork, r, o.m); commitScene(); renderObjects(); showSelection();
-  };
-  if ($('selCopy')) $('selCopy').onclick = () => {
-    try {
+async function fillKinds() {
+  const id = $('addFrom').value, sel = $('addKind');
+  try {
+    const src = await sourceStadium(id), kinds = propKinds(src.scene).filter((k) => k.i != null);
+    if ($('addFrom').value !== id) return;
+    sel.innerHTML = kinds.map((k) => `<option value="${k.i}">${esc(stem(k.kind) || k.kind)} (×${k.count})</option>`).join('') || '<option value="">No props here</option>';
+    $('addBtn').disabled = !kinds.length;
+  } catch (e) { sel.innerHTML = '<option value="">Could not read it</option>'; console.error(e); }
+}
+async function addFromStadium() {
+  const id = $('addFrom').value, i = +$('addKind').value; if (!isFinite(i)) return;
+  busy('Adding the prop…'); await new Promise((r) => setTimeout(r, 20));
+  try {
+    const src = await sourceStadium(id), m = src.scene.recs[i].m.slice(); m[12] = 0; m[13] = 0;   // its own turn, size and height, over the centre spot
+    pushUndo();
+    const r = addProp({ world: cur.work, res: cur.resWork, names: nameOf }, src, i, m);
+    for (const n of r.names) if (!game.names.get(nlHash(n))) extraNames.set(nlHash(n), n);
+    if (r.tmp !== cur.work.tmp) { const z = packZlib(r.tmp); setEdit(cur.tmpPath, z, null); cur.work = parseWorld(z, game.names); }
+    cur.resWork = r.res; commitScene(); await refresh(); renderAll();
+    const nr = cur.scene.recs.find((x) => x.name === r.name && x.kind === KIND.PROXY); if (nr) select(nr.i, true);
+    const a = r.added, bits = [a.models && `${a.models} model${a.models > 1 ? 's' : ''}`, a.textures && `${a.textures} texture${a.textures > 1 ? 's' : ''}`, a.animations && `its animation (${a.skeleton})`].filter(Boolean);
+    toast(`Added ${r.name}${bits.length ? ', with ' + bits.join(', ') : ''}.`);
+  } catch (e) { toast(e.message || String(e), true); console.error(e); } finally { busy(false); }
+}
+// names of props copied or added before (in a mod opened again): the game's name list doesn't have them
+function guessNames(scene, orig) {
+  const unknown = scene.recs.filter((r) => r.kind === KIND.PROXY && !r.name); if (!unknown.length) return false;
+  const stems = new Map();
+  const learn = (sc) => { if (!sc) return; for (const r of sc.recs) if (r.kind === KIND.PROXY && r.name) { const st = r.name.replace(/\d+$/, ''), w = (r.name.match(/\d+$/) || [''])[0].length; if (!stems.has(st)) stems.set(st, { w, kids: (r.kids || []).map((k) => sc.recs[k].name).filter(Boolean).map((n) => n.slice(r.name.length)) }); } };
+  learn(orig); learn(scene); for (const s of srcCache.values()) learn(s.scene);
+  let found = 0;
+  for (const r of unknown) for (const [st, { w, kids }] of stems) {
+    let hit = null; for (let n = 1; n < 1000 && !hit; n++) { const nm = st + String(n).padStart(w, '0'); if (nlHash(nm) === r.hash) hit = nm; }
+    if (!hit) continue;
+    extraNames.set(r.hash, hit); for (const k of kids) extraNames.set(nlHash(hit + k), hit + k); found++; break;
+  }
+  return found > 0;
+}
+const objBtn = (r, ch) => `<button class="obj ${isOn(r.i) ? 'on' : ''} ${ch ? 'changed' : ''}" data-i="${r.i}" title="${esc(r.name || '')}">${esc((r.name || hex8(r.hash)).replace(/^.*\//, ''))}${ch ? ' ●' : ''}</button>`;
+// ---- selection: one or many objects (cur.selSet), cur.sel the one clicked last
+const selList = () => { const sc = sceneFor(); return [...(cur.selSet || [])].filter((i) => sc && sc.recs[i] && sc.recs[i].m); };
+const isOn = (i) => !!(cur.selSet && cur.selSet.has(i));
+function setSel(list, primary, frame) {
+  cur.selSet = new Set(list); cur.sel = primary != null ? primary : list.length ? list[list.length - 1] : null;
+  cur.selBase = null; cur.grp = null;
+  showSelection(); if (frame) lookAtSel(); syncListSel(); renderSelEditor();
+}
+function toggleSel(i) { const s = new Set(cur.selSet || []); if (s.has(i)) s.delete(i); else s.add(i); setSel([...s], s.has(i) ? i : null); }
+function select(i, frame) { setSel(i == null ? [] : [i], i, frame); }
+function syncListSel() { const p = $('pane-objects'); if (!p) return; for (const b of p.querySelectorAll('.obj')) b.classList.toggle('on', isOn(+b.dataset.i)); }
+// keep the same objects selected after the list changed (copies, removals, undo): by name
+const selKeys = () => new Set(selList().map((i) => sceneFor().recs[i].hash));
+function reselect(keys, frame) { const sc = sceneFor(); setSel(sc.recs.filter((r) => keys.has(r.hash) && groupOf(r)).map((r) => r.i), null, frame); }
+
+// the 3D objects drawing record i (prop pieces and markers)
+const viewObjs = (i) => [...((view.propOf && view.propOf.get(i)) || []), ...((view.markOf && view.markOf.get(i)) || [])];
+function showSelection() {
+  if (view.selGroup) { view.scene.remove(view.selGroup); view.selGroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); view.selGroup = null; }
+  view.selAll = null;
+  const sel = selList(); if (!sel.length) return;
+  view.selGroup = new THREE.Group(); const all = new THREE.Box3();
+  for (const i of sel.slice(0, 600)) {
+    const box = new THREE.Box3(); for (const o of viewObjs(i)) box.expandByObject(o);
+    if (box.isEmpty()) { const p = new THREE.Vector3().applyMatrix4(toView(worldMatrix(sceneFor(), i))); box.setFromCenterAndSize(p, new THREE.Vector3(1, 1, 1)); }
+    box.expandByScalar(0.15); all.union(box);
+    view.selGroup.add(new THREE.Box3Helper(box, i === cur.sel ? 0xffee00 : 0xffa500));
+  }
+  if (sel.length > 1) view.selGroup.add(new THREE.Box3Helper(all.clone().expandByScalar(0.6), 0x77ddff));
+  view.selAll = all; view.scene.add(view.selGroup);
+}
+function lookAtSel() {
+  if (!view.selAll) return;
+  const c = view.selAll.getCenter(new THREE.Vector3()), sz = view.selAll.getSize(new THREE.Vector3()).length();
+  const dir = view.camera.position.clone().sub(view.controls.target).normalize();
+  view.controls.target.copy(c); view.camera.position.copy(c.clone().add(dir.multiplyScalar(Math.max(6, sz * 1.3)))); view.controls.update();
+}
+
+// ---- moving: matrices are the game's (column-major, z up, position in 12..14)
+const deg = Math.PI / 180;
+function turnM(m, a, cx, cy) {   // turn by a degrees around the up axis through (cx, cy)
+  const c = Math.cos(a * deg), s = Math.sin(a * deg), o = m.slice();
+  for (let col = 0; col < 3; col++) { const x = m[col * 4], y = m[col * 4 + 1]; o[col * 4] = c * x - s * y; o[col * 4 + 1] = s * x + c * y; }
+  const x = m[12] - cx, y = m[13] - cy; o[12] = cx + c * x - s * y; o[13] = cy + s * x + c * y; return o;
+}
+const moveM = (m, dx, dy, dz) => { const o = m.slice(); o[12] += dx; o[13] += dy; o[14] += dz; return o; };
+const parentW = (sc, r) => (r.parent != null ? worldMatrix(sc, r.parent) : null);
+const m4 = (a) => new THREE.Matrix4().fromArray(a);
+// draw the selection where newM(i) would put it, without writing anything
+function preview(newM) {
+  const sc = sceneFor();
+  for (const i of selList()) {
+    const r = sc.recs[i], pw = parentW(sc, r), nm = newM(i);
+    const oldW = toView(worldMatrix(sc, i)), newW = toView(pw ? m4(pw).multiply(m4(nm)).toArray() : nm);
+    const D = newW.multiply(oldW.invert());
+    for (const o of viewObjs(i)) { if (!o.userData.start) o.userData.start = o.matrix.clone(); o.matrix.copy(D.clone().multiply(o.userData.start)); o.updateMatrixWorld(true); }
+  }
+}
+// write newM(i) for every selected object (one undo step)
+function commitMove(newM, keepBase) {
+  if (cur.view === 'orig') return;
+  const sc = sceneFor(), sel = selList(); if (!sel.length) return;
+  pushUndo();
+  for (const i of sel) setMatrix(cur.resWork, sc.recs[i], newM(i));
+  const base = cur.selBase, grp = cur.grp;
+  commitScene();
+  if (keepBase) { cur.selBase = base; cur.grp = grp; } else { cur.selBase = null; cur.grp = null; }
+  showSelection(); markChangedObjs(); setTimeout(renderSelEditor, 0);   // later: the box being typed in may still be losing focus
+}
+// the group sliders work from where the objects were when they were selected
+function groupM() {
+  const sc = sceneFor(), sel = selList();
+  if (!cur.selBase) { cur.selBase = new Map(sel.map((i) => [i, sc.recs[i].m.slice()])); cur.grp = { dx: 0, dy: 0, dz: 0, turn: 0, spread: 100 }; }
+  const g = cur.grp, f = g.spread / 100, base = cur.selBase;
+  let cx = 0, cy = 0; for (const m of base.values()) { cx += m[12] * f; cy += m[13] * f; } cx /= base.size || 1; cy /= base.size || 1;
+  return (i) => { let m = base.get(i).slice(); m[12] *= f; m[13] *= f; m = turnM(m, g.turn, cx, cy); return moveM(m, g.dx, g.dy, g.dz); };
+}
+const snapOn = () => !!cur.snap;
+const snapV = (v, s) => (snapOn() ? Math.round(v / s) * s : v);
+
+// ---- undo / redo (the object list, plus models and textures when a prop was brought in)
+function snapshot() { return { res: cur.resWork.slice(), tmp: edits.get(cur.tmpPath) || null, names: new Map(extraNames) }; }
+function pushUndo() { cur.undo = cur.undo || []; cur.undo.push(snapshot()); if (cur.undo.length > 60) cur.undo.shift(); cur.redo = []; }
+async function restore(s) {
+  const keys = selKeys();
+  for (const [h, n] of s.names) extraNames.set(h, n);
+  const tmpNow = edits.get(cur.tmpPath) || null;
+  cur.resWork = s.res; commitScene();
+  if (tmpNow !== s.tmp) {
+    if (s.tmp) { setEdit(cur.tmpPath, s.tmp, null); cur.work = parseWorld(s.tmp, game.names); } else { edits.delete(cur.tmpPath); cur.work = cur.orig; }
+    await refresh();
+  }
+  renderObjects(); reselect(keys);
+}
+async function undo() { if (!cur || !cur.undo || !cur.undo.length) { toast('Nothing to undo.'); return; } const s = cur.undo.pop(); (cur.redo = cur.redo || []).push(snapshot()); await restore(s); toast('Undone.'); }
+async function redo() { if (!cur || !cur.redo || !cur.redo.length) { toast('Nothing to redo.'); return; } const s = cur.redo.pop(); cur.undo.push(snapshot()); await restore(s); toast('Redone.'); }
+
+// ---- actions on the selection
+function removeSel() {
+  const sc = sceneFor(), sel = selList(), props = sel.filter((i) => sc.recs[i].kind === KIND.PROXY), other = sel.length - props.length;
+  if (!props.length) { toast('Only props can be removed. Crowd spots, flag spots, riot guards and effects can be moved (the game expects them).', true); return; }
+  try {
+    pushUndo(); cur.resWork = removeProps(cur.resWork, sc, props); commitScene(); renderObjects(); setSel([]);
+    toast(`Removed ${props.length} prop${props.length > 1 ? 's' : ''}.` + (other ? ` ${other} other object${other > 1 ? 's were' : ' was'} kept: only props can be removed.` : ''));
+  } catch (e) { toast(e.message, true); }
+}
+function copySel() {
+  const sel = selList().filter((i) => sceneFor().recs[i].kind === KIND.PROXY && sceneFor().recs[i].name);
+  if (!sel.length) { toast('Only props can be copied.', true); return; }
+  pushUndo(); const made = new Set();
+  try {
+    const names = sel.map((i) => sceneFor().recs[i].name);
+    for (const nm of names) {
+      const sc = sceneFor(), r = sc.recs.find((x) => x.kind === KIND.PROXY && x.name === nm); if (!r) continue;
       const name = freeName(sc, r.name), m = r.m.slice(); m[12] += 2;
       const out = copyProp(cur.resWork, sc, r.i, name, m);
       extraNames.set(nlHash(name), name);
-      for (const k of [r.i, ...(r.kids || [])]) { const n = sc.recs[k].name; if (n) extraNames.set(nlHash(name + n.slice(r.name.length)), name + n.slice(r.name.length)); }
       const deep = (j) => { for (const k of sc.recs[j].kids || []) { const n = sc.recs[k].name; if (n) extraNames.set(nlHash(name + n.slice(r.name.length)), name + n.slice(r.name.length)); deep(k); } }; deep(r.i);
-      cur.resWork = out; commitScene();
-      const nr = cur.scene.recs.find((x) => x.name === name && x.kind === KIND.PROXY);
-      renderObjects(); if (nr) select(nr.i, true);
-      toast(`Copied as ${name}.`);
-    } catch (e) { toast(e.message, true); }
-  };
+      cur.resWork = out; cur.scene = parseScene(cur.resWork, nameOf); made.add(nlHash(name));
+    }
+    commitScene(); renderObjects(); reselect(made, true);
+    toast(`Copied ${made.size} prop${made.size > 1 ? 's' : ''}, 2 m along. The copies are selected: move them where you want.`);
+  } catch (e) { toast(e.message, true); }
+}
+function putBackSel() {
+  const sc = sceneFor(), orig = new Map(cur.origScene.recs.map((o) => [o.kind + ':' + o.hash, o]));
+  const sel = selList().filter((i) => orig.has(sc.recs[i].kind + ':' + sc.recs[i].hash));
+  if (!sel.length) { toast('These are new: use Remove to take them out.', true); return; }
+  commitMove((i) => (orig.get(sc.recs[i].kind + ':' + sc.recs[i].hash) || sc.recs[i]).m);
+}
+// drop each selected object onto the stadium below it (the first floor facing up)
+function sitSel() {
+  if (!view.model) return;
+  const sc = sceneFor(), sel = selList(); if (!sel.length) return;
+  const meshes = []; view.model.traverse((o) => { if (o.isMesh && o.visible) { let p = o, inProps = false; while (p) { if (p === view.props) { inProps = true; break; } p = p.parent; } if (!inProps) meshes.push(o); } });
+  const ray = new THREE.Raycaster(); ray.far = 300; const nm = new Map(); let missed = 0;
+  for (const i of sel) {
+    const w = worldMatrix(sc, i), p = new THREE.Vector3(w[12], w[14] + 40, -w[13]);   // game -> view (y up)
+    ray.set(p, new THREE.Vector3(0, -1, 0));
+    const hit = ray.intersectObjects(meshes, false).find((h) => h.face && h.face.normal.clone().transformDirection(h.object.matrixWorld).y > 0.3);
+    if (!hit) { missed++; continue; }
+    const r = sc.recs[i], dz = hit.point.y - w[14]; nm.set(i, moveM(r.m, 0, 0, dz));
+  }
+  if (!nm.size) { toast('Nothing under them to sit on.', true); return; }
+  const keep = new Set(cur.selSet); cur.selSet = new Set(nm.keys());
+  commitMove((i) => nm.get(i)); cur.selSet = keep; showSelection(); renderSelEditor();
+  toast(`Put ${nm.size} on the stadium below them${missed ? `; ${missed} had nothing under them` : ''}.`);
+}
+
+// ---- the editor for the selection
+const ROW = (id, label, v, min, max, step, edit, unit = '') => `<label for="${id}">${label}</label><input type="range" id="${id}R" min="${min}" max="${max}" step="${step}" value="${v}" ${edit ? '' : 'disabled'}><input type="number" id="${id}" step="${step}" value="${(+v).toFixed(step < 1 ? 2 : 0)}" ${edit ? '' : 'disabled'}>${unit}`;
+function renderSelEditor() {
+  const el = $('selEditor'); if (!el) return;
+  const sc = sceneFor(), sel = selList(), edit = cur.view !== 'orig';
+  if (!sel.length) { el.innerHTML = `<div class="box tips"><b>Selecting:</b> click an object here or in the 3D view. <b>Ctrl+click</b> adds or takes one away; <b>Shift+drag</b> in the 3D view draws a box around many (turn on Markers to include crowd and flag spots); the <b>Select all</b> buttons take a whole group.</div>`; return; }
+  const props = sel.filter((i) => sc.recs[i].kind === KIND.PROXY).length;
+  const tools = `<div class="btns">
+      <button class="small" id="selLook">Look at ${sel.length > 1 ? 'them' : 'it'}</button>
+      ${edit ? `<button class="small" id="selSit" title="Drops ${sel.length > 1 ? 'each one' : 'it'} straight down onto the stadium (stands, steps, the ground)">Sit on the stadium</button>
+      <button class="small" id="selBack">Put back</button>
+      ${props ? `<button class="small" id="selCopy">Copy${sel.length > 1 ? ` ${props} prop${props > 1 ? 's' : ''}` : ''}</button><button class="small danger" id="selDel">Remove${sel.length > 1 ? ` ${props} prop${props > 1 ? 's' : ''}` : ''}</button>` : ''}` : ''}
+      <button class="small" id="selNone">Select none</button></div>
+    ${edit ? `<label class="snap"><input type="checkbox" id="snap" ${cur.snap ? 'checked' : ''}> Snap (0.5 m, 15°)</label>
+    <p class="dim keys">In the 3D view: <b>drag</b> ${sel.length > 1 ? 'one of them' : 'it'} to move along the ground, <b>Alt+drag</b> to raise or lower · arrow keys nudge (Shift: 2 m) · PgUp/PgDn height · Q/E turn · Del remove · Ctrl+D copy · Ctrl+Z undo</p>` : ''}`;
+  if (sel.length === 1) {
+    const r = sc.recs[sel[0]], g = groupOf(r), p = getPlace(r);
+    el.innerHTML = `<div class="box sel"><b>${esc(r.name || hex8(r.hash))}</b> <span class="chip">${esc(g ? g.title.replace(/s$/, '') : '')}</span>
+      <div class="set3">${ROW('px', 'x (along)', p.x, -150, 150, 0.25, edit)}${ROW('py', 'y (across)', p.y, -150, 150, 0.25, edit)}${ROW('pz', 'z (height)', p.z, -40, 120, 0.25, edit)}${ROW('pt', 'Turn (°)', p.turn, -180, 180, 1, edit)}</div>${tools}</div>`;
+    if (edit) {
+      const val = (id) => +$(id).value, fn = () => { const v = { x: val('px'), y: val('py'), z: val('pz'), turn: val('pt') }; return Object.values(v).every(isFinite) ? () => withPlace(r, v) : null; };
+      for (const id of ['px', 'py', 'pz', 'pt']) {
+        $(id + 'R').oninput = () => { $(id).value = (+$(id + 'R').value).toFixed(id === 'pt' ? 0 : 2); const f = fn(); if (f) preview(f); };
+        $(id + 'R').onchange = $(id).onchange = (e) => { if (e.target === $(id)) $(id + 'R').value = $(id).value; const f = fn(); if (f) commitMove(f); };
+      }
+    }
+  } else {
+    const count = new Map(); for (const i of sel) { const g = groupOf(sc.recs[i]); const t = g ? g.title.toLowerCase() : 'other'; count.set(t, (count.get(t) || 0) + 1); }
+    const g = cur.grp || { dx: 0, dy: 0, dz: 0, turn: 0, spread: 100 };
+    el.innerHTML = `<div class="box sel"><b>${sel.length} selected</b> <span class="dim">(${[...count].map(([t, n]) => `${n} ${esc(t)}`).join(', ')})</span>
+      ${edit ? `<p class="dim" style="margin:6px 0 2px">Moves them together, from where they were when you selected them.</p>
+      <div class="set3">${ROW('gx', 'x (along)', g.dx, -100, 100, 0.25, edit, '')}${ROW('gy', 'y (across)', g.dy, -100, 100, 0.25, edit)}${ROW('gz', 'z (height)', g.dz, -40, 60, 0.25, edit)}${ROW('gt', 'Turn (°)', g.turn, -180, 180, 1, edit)}${ROW('gs', 'Spread (%)', g.spread, 25, 250, 1, edit)}</div>
+      <p class="dim" style="margin:2px 0 6px">Turn goes round their middle. Spread moves them away from the centre spot (over 100%) or in towards it.</p>` : ''}${tools}</div>`;
+    if (edit) {
+      const map = { gx: 'dx', gy: 'dy', gz: 'dz', gt: 'turn', gs: 'spread' };
+      for (const id of Object.keys(map)) {
+        const take = (src) => { const v = +src.value; if (!isFinite(v)) return false; groupM(); cur.grp[map[id]] = v; return true; };
+        $(id + 'R').oninput = () => { $(id).value = (+$(id + 'R').value).toFixed(id === 'gt' || id === 'gs' ? 0 : 2); if (take($(id + 'R'))) preview(groupM()); };
+        $(id + 'R').onchange = $(id).onchange = (e) => { if (e.target === $(id)) $(id + 'R').value = $(id).value; if (take(e.target)) commitMove(groupM(), true); };
+      }
+    }
+  }
+  $('selLook').onclick = lookAtSel; $('selNone').onclick = () => setSel([]);
+  if (!edit) return;
+  $('snap').onchange = (e) => { cur.snap = e.target.checked; };
+  $('selSit').onclick = sitSel; $('selBack').onclick = putBackSel;
+  if ($('selDel')) $('selDel').onclick = removeSel;
+  if ($('selCopy')) $('selCopy').onclick = copySel;
 }
 function markChangedObjs() {
-  const sc = sceneFor();
-  for (const b of $('pane-objects').querySelectorAll('.obj')) { const r = sc.recs[+b.dataset.i]; const o = cur.origScene.recs.find((x) => x.hash === r.hash && x.kind === r.kind); const ch = !o || (r.m && r.m.some((v, k) => Math.abs(v - o.m[k]) > 1e-5)); b.classList.toggle('changed', !!ch); b.textContent = (r.name || hex8(r.hash)).replace(/^.*\//, '') + (ch ? ' ●' : ''); }
+  const sc = sceneFor(), p = $('pane-objects'); if (!p) return;
+  for (const b of p.querySelectorAll('.obj')) { const r = sc.recs[+b.dataset.i]; if (!r) continue; const o = cur.origScene.recs.find((x) => x.hash === r.hash && x.kind === r.kind); const ch = !o || (r.m && r.m.some((v, k) => Math.abs(v - o.m[k]) > 1e-5)); b.classList.toggle('changed', !!ch); b.textContent = (r.name || hex8(r.hash)).replace(/^.*\//, '') + (ch ? ' ●' : ''); }
 }
-// click to select in the 3D view (a click, not a drag)
+
+// ---- the 3D view: click to select, Ctrl+click to add, Shift+drag a box, drag a selected object to move it
+function rayAt(e) {
+  const rect = view.r.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
+  ray.setFromCamera(new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1), view.camera);
+  return ray;
+}
+function pickAt(e) {
+  const targets = [...(view.props ? view.props.children : []), ...(view.marks && view.marks.visible ? view.marks.children : [])];
+  const hit = rayAt(e).intersectObjects(targets, true).find((h) => { let o = h.object; while (o && o.userData.rec == null) o = o.parent; return !!o; });
+  if (!hit) return null;
+  let o = hit.object; while (o.userData.rec == null) o = o.parent;
+  return { i: o.userData.rec, point: hit.point };
+}
 function initPicking() {
-  const el = view.r.domElement; let down = null;
-  el.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; });
-  el.addEventListener('pointerup', (e) => {
-    if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4 || !cur) return;
-    const rect = el.getBoundingClientRect(), ray = new THREE.Raycaster();
-    ray.setFromCamera(new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1), view.camera);
-    const targets = [...(view.props ? view.props.children : []), ...(view.marks && view.marks.visible ? view.marks.children : [])];
-    const hit = ray.intersectObjects(targets, true).find((h) => h.object.userData.rec != null || (h.object.parent && h.object.parent.userData.rec != null));
-    if (!hit) return;
-    const i = hit.object.userData.rec != null ? hit.object.userData.rec : hit.object.parent.userData.rec;
-    tab('objects'); select(i, false);
+  const el = view.r.domElement, vbox = $('view');
+  const rectEl = document.createElement('div'); rectEl.className = 'selrect'; vbox.appendChild(rectEl);
+  let down = null, mode = null, drag = null;
+  el.addEventListener('pointerdown', (e) => {
+    down = { x: e.clientX, y: e.clientY }; mode = null; drag = null;
+    if (!cur || e.button !== 0) return;
+    if (e.shiftKey) { mode = 'box'; view.controls.enabled = false; el.setPointerCapture(e.pointerId); return; }
+    if (cur.view === 'orig' || e.ctrlKey || e.metaKey) return;
+    const hit = pickAt(e); if (!hit || !isOn(hit.i)) return;
+    // drag the selection: along the ground through the point grabbed, or up and down with Alt
+    mode = 'move'; view.controls.enabled = false; el.setPointerCapture(e.pointerId);
+    const n = e.altKey ? view.camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize().negate() : new THREE.Vector3(0, 1, 0);
+    if (n.lengthSq() < 1e-6) n.set(0, 0, 1);
+    drag = { plane: new THREE.Plane().setFromNormalAndCoplanarPoint(n, hit.point), from: hit.point.clone(), up: e.altKey, d: [0, 0, 0] };
+  }, { capture: true });
+  el.addEventListener('pointermove', (e) => {
+    if (!down || !mode) return;
+    if (mode === 'box') {
+      const r = vbox.getBoundingClientRect(), x0 = Math.min(down.x, e.clientX) - r.left, y0 = Math.min(down.y, e.clientY) - r.top;
+      Object.assign(rectEl.style, { display: 'block', left: x0 + 'px', top: y0 + 'px', width: Math.abs(e.clientX - down.x) + 'px', height: Math.abs(e.clientY - down.y) + 'px' });
+      return;
+    }
+    const p = rayAt(e).ray.intersectPlane(drag.plane, new THREE.Vector3()); if (!p) return;
+    const v = p.sub(drag.from);   // view space: x, y up, z = -game y
+    drag.d = drag.up ? [0, 0, snapV(v.y, 0.5)] : [snapV(v.x, 0.5), snapV(-v.z, 0.5), 0];
+    preview((i) => moveM(sceneFor().recs[i].m, ...drag.d));
+  });
+  const end = (e) => {
+    const was = mode, moved = down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4;
+    view.controls.enabled = true; rectEl.style.display = 'none';
+    if (was === 'box') {
+      if (moved) {
+        const r = el.getBoundingClientRect(), x0 = Math.min(down.x, e.clientX) - r.left, x1 = Math.max(down.x, e.clientX) - r.left, y0 = Math.min(down.y, e.clientY) - r.top, y1 = Math.max(down.y, e.clientY) - r.top;
+        const sc = sceneFor(), got = [], showMarks = view.marks && view.marks.visible;
+        for (const rec of sc.recs) {
+          const g = groupOf(rec); if (!g || (!showMarks && g.id !== 'props')) continue;
+          const w = worldMatrix(sc, rec.i), q = new THREE.Vector3(w[12], w[14], -w[13]).project(view.camera);
+          if (q.z > 1) continue;
+          const sx = (q.x + 1) / 2 * r.width, sy = (1 - q.y) / 2 * r.height;
+          if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) got.push(rec.i);
+        }
+        const keep = e.ctrlKey || e.metaKey ? selList() : [];
+        tab('objects'); setSel([...new Set([...keep, ...got])]);
+        toast(got.length ? `Selected ${got.length}${keep.length ? ' more' : ''}.` : 'Nothing in that box' + (showMarks ? '.' : ' (turn on Markers to include crowd and flag spots).'));
+      }
+    } else if (was === 'move') {
+      if (moved && drag && drag.d.some((v) => v)) { const d = drag.d; commitMove((i) => moveM(sceneFor().recs[i].m, ...d)); }
+      else {
+        for (const i of selList()) for (const o of viewObjs(i)) if (o.userData.start) { o.matrix.copy(o.userData.start); o.updateMatrixWorld(true); }
+        if (!moved) { const hit = pickAt(e); if (hit) select(hit.i, false); }   // a click on one of several: just that one
+      }
+    } else if (down && !moved && cur && e.button === 0) {
+      const hit = pickAt(e);
+      if (hit) { tab('objects'); if (e.ctrlKey || e.metaKey) toggleSel(hit.i); else select(hit.i, false); }
+      else if ($('pane-objects').classList.contains('on') && !(e.ctrlKey || e.metaKey)) setSel([]);
+    }
+    down = null; mode = null; drag = null;
+  };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+  // keys (not while typing in a box)
+  document.addEventListener('keydown', (e) => {
+    if (!cur || /^(INPUT|SELECT|TEXTAREA)$/.test((e.target.tagName || '')) || !$('pane-objects').classList.contains('on')) return;
+    const k = e.key.toLowerCase(), ctrl = e.ctrlKey || e.metaKey;
+    if (ctrl && k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+    if (ctrl && k === 'y') { e.preventDefault(); redo(); return; }
+    if (k === 'escape') { setSel([]); return; }
+    const sel = selList(); if (!sel.length || cur.view === 'orig') return;
+    if (ctrl && k === 'a') { e.preventDefault(); const g = groupOf(sceneFor().recs[cur.sel ?? sel[0]]); if (g) setSel(sceneFor().recs.filter((r) => groupOf(r) === g).map((r) => r.i)); return; }
+    if (ctrl && k === 'd') { e.preventDefault(); copySel(); return; }
+    if (k === 'delete' || k === 'backspace') { e.preventDefault(); removeSel(); return; }
+    const step = e.shiftKey ? 2 : 0.5;
+    // arrows move along the ground as the camera looks: up = away from you
+    const f = view.camera.getWorldDirection(new THREE.Vector3()); let fx = f.x, fy = -f.z; const fl = Math.hypot(fx, fy) || 1; fx /= fl; fy /= fl;
+    const ax = Math.abs(fx) > Math.abs(fy) ? [Math.sign(fx), 0] : [0, Math.sign(fy)];   // the nearest of the game's axes
+    const fwd = ax, right = [fwd[1], -fwd[0]];
+    const mv = { arrowup: fwd, arrowdown: [-fwd[0], -fwd[1]], arrowright: right, arrowleft: [-right[0], -right[1]] }[k];
+    if (mv) { e.preventDefault(); commitMove((i) => moveM(sceneFor().recs[i].m, mv[0] * step, mv[1] * step, 0)); return; }
+    if (k === 'pageup' || k === 'pagedown') { e.preventDefault(); const dz = (k === 'pageup' ? 1 : -1) * (e.shiftKey ? 1 : 0.25); commitMove((i) => moveM(sceneFor().recs[i].m, 0, 0, dz)); return; }
+    if (k === 'q' || k === 'e') {
+      e.preventDefault(); const a = (k === 'q' ? 1 : -1) * (e.shiftKey ? 45 : 15), sc = sceneFor();
+      if (sel.length === 1) { const m = sc.recs[sel[0]].m; commitMove(() => turnM(m, a, m[12], m[13])); return; }
+      let cx = 0, cy = 0; for (const i of sel) { cx += sc.recs[i].m[12]; cy += sc.recs[i].m[13]; } cx /= sel.length; cy /= sel.length;
+      commitMove((i) => turnM(sc.recs[i].m, a, cx, cy));
+    }
   });
 }
 
@@ -647,6 +986,9 @@ function renderMod() {
     <div class="btns"><button class="primary" id="mkPack" ${files.length ? '' : 'disabled'}>Download mod pack (.zip)</button></div>
     <ol class="steps"><li>Unzip it into <code>%LOCALAPPDATA%\\MSCRecomp\\Riivolution</code>.</li><li>In the game: <b>F10 &gt; Mods</b>, turn it on, restart the game.</li></ol>
     <p class="dim">One pack holds every change you made here, across all the stadiums and teams.</p>
+    <h2>Keep working on a mod</h2>
+    <p class="dim">Open a mod pack you made before (the .zip) to carry on where you left off. Its changes replace the ones open here.</p>
+    <div class="btns"><button id="openPack">Open a mod pack…</button></div>
     <h2>Just the files</h2>
     <div class="btns"><button id="mkFiles" ${files.length ? '' : 'disabled'}>Files in the game's layout (.zip)</button></div>
     <h2>Start over</h2>
@@ -657,11 +999,42 @@ function renderMod() {
     const name = $('modName').value.trim() || 'My stadium mod', desc = $('modDesc').value.trim();
     const slug = (name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'stadium_mod').slice(0, 40);
     const xml = `<wiidisc version="1" root="/${slug}">\n  <id game="R4QE"/>\n  <options>\n    <section name="${xe(name)}">\n      <option name="${xe(name)}" id="${slug}" default="1" description="${xe(desc)}">\n        <choice name="Enabled"><patch id="${slug}"/></choice>\n      </option>\n    </section>\n  </options>\n  <patch id="${slug}">\n    <folder disc="/" external="files" create="true"/>\n  </patch>\n</wiidisc>\n`;
-    download(`${slug}.zip`, zipSync({ [`riivolution/${slug}.xml`]: new TextEncoder().encode(xml), ...zipFiles(`${slug}/files/`) }, { level: 0 }));
+    const info = { app: 'Strikers Stadium Studio', name, description: desc, names: Object.fromEntries([...extraNames].map(([h, n]) => [hex8(h), n])) };
+    download(`${slug}.zip`, zipSync({ [`riivolution/${slug}.xml`]: new TextEncoder().encode(xml), [`${slug}/stadium-studio.json`]: new TextEncoder().encode(JSON.stringify(info, null, 1)), ...zipFiles(`${slug}/files/`) }, { level: 0 }));
   };
   $('mkFiles').onclick = () => download('stadium_files.zip', zipSync(zipFiles(''), { level: 0 }));
-  $('resetOne').onclick = async () => { resetStadium(); cur.sel = null; await refresh(); renderAll(); };
-  $('resetAll').onclick = async () => { if (!confirm('Discard every change?')) return; edits.clear(); cur.work = cur.orig; if (cur.origRes) { cur.resWork = cur.origRes.slice(); cur.scene = parseScene(cur.resWork, nameOf); } cur.sel = null; window.onbeforeunload = null; await refresh(); renderAll(); if ($('pane-fans').classList.contains('on')) renderFans(); };
+  $('openPack').onclick = () => { const inp = $('packInput'); inp.value = ''; inp.onchange = () => inp.files[0] && openPack(inp.files[0]); inp.click(); };
+  $('resetOne').onclick = async () => { resetStadium(); cur.sel = null; cur.selSet = new Set(); await refresh(); renderAll(); };
+  $('resetAll').onclick = async () => { if (!confirm('Discard every change?')) return; edits.clear(); cur.work = cur.orig; if (cur.origRes) { cur.resWork = cur.origRes.slice(); cur.scene = parseScene(cur.resWork, nameOf); } cur.sel = null; cur.selSet = new Set(); window.onbeforeunload = null; await refresh(); renderAll(); if ($('pane-fans').classList.contains('on')) renderFans(); };
+}
+// a mod pack made here (or any Riivolution pack / "just the files" zip with stadium files in it)
+async function openPack(file) {
+  busy('Opening the mod pack…');
+  try {
+    const z = unzipSync(new Uint8Array(await file.arrayBuffer())), dec = new TextDecoder();
+    let root = null, xmlName = null, info = null;
+    for (const k of Object.keys(z)) {
+      const m = /^(?:.*\/)?riivolution\/([^/]+)\.xml$/i.exec(k);
+      if (m) { const x = dec.decode(z[k]); const ext = /external="([^"]+)"/.exec(x), rt = /root="\/?([^"]*)"/.exec(x), sec = /<section name="([^"]+)"/.exec(x); root = ((rt ? rt[1] : m[1]) + '/' + (ext ? ext[1] : 'files') + '/').replace(/^\/+/, ''); xmlName = sec && sec[1]; }
+      if (/stadium-studio\.json$/i.test(k)) try { info = JSON.parse(dec.decode(z[k])); } catch (e) { /* not ours */ }
+    }
+    const pick = new Map();
+    for (const [k, data] of Object.entries(z)) {
+      if (k.endsWith('/') || !data.length) continue;
+      let rel = null;
+      if (root && k.toLowerCase().startsWith(root.toLowerCase())) rel = k.slice(root.length);
+      else if (!root) { const m = /(?:^|\/)((?:art|ini)\/.+)$/i.exec(k); if (m) rel = m[1]; }
+      if (rel && has(rel)) pick.set(rel.toLowerCase(), data);
+    }
+    if (!pick.size) throw new Error("That zip has no stadium, fan or settings files this app knows.");
+    edits.clear(); for (const [k, v] of pick) edits.set(k, v);
+    if (info && info.names) for (const [h, n] of Object.entries(info.names)) extraNames.set(parseInt(h, 16) >>> 0, n);
+    game.modName = (info && info.name) || xmlName || game.modName; if (info && info.description) game.modDesc = info.description;
+    window.onbeforeunload = () => 'You have changes that are not saved in a mod yet.';
+    srcCache.clear();
+    await openStadium(cur.id);
+    toast(`Opened ${file.name}: ${pick.size} changed file${pick.size > 1 ? 's' : ''}.`);
+  } catch (e) { toast(e.message || String(e), true); console.error(e); } finally { busy(false); }
 }
 const xe = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -730,6 +1103,6 @@ function init() {
   $('light').onchange = applyDisplay; $('wire').onchange = applyDisplay; $('cut').onchange = applyDisplay;
   $('marks').onchange = () => { if (view.marks) view.marks.visible = $('marks').checked; };
   initPicking();
-  window.__stadium = { game, edits, get cur() { return cur; }, openStadium, tab, select, view };
+  window.__stadium = { game, edits, get cur() { return cur; }, openStadium, tab, select, view, openPack, extraNames };
 }
 init();

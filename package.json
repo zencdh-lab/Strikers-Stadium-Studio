@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "esbuild src/stadium-app.js --bundle --format=iife --minify --target=es2020 --outfile=app/stadium.js --legal-comments=none",
-    "test": "node tests/ini.test.mjs && node tests/scene.test.mjs"
+    "test": "node tests/ini.test.mjs && node tests/scene.test.mjs && node tests/propimport.test.mjs && node tests/stadiumimport.test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",

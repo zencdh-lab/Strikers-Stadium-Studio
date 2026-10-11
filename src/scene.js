@@ -88,38 +88,42 @@ export function withPlace(rec, { x, y, z, turn }) {
   return m;
 }
 
-// copy a prop (its animation binding, the prop and its children) under a new name, placed at `m`.
-// Name hashes of the copies are the game's hash of their new full names; short names stay.
-// Returns { res, name } (a new, longer res).
-export function copyProp(res, scene, i, newName, m) {
+// a prop's records (its animation binding, the prop, its children) renamed to `newName` and placed
+// at `m`: full-name hashes become the game's hash of the new full names; short names stay.
+export function propRecords(res, scene, i, newName, m) {
   const p = scene.recs[i]; if (p.kind !== KIND.PROXY || !p.name) throw new Error('Only props with a known name can be copied.');
-  const group = [p.binding, i, ...allKids(scene, i)].filter((x) => x != null).sort((a, b) => a - b);
+  const kids = allKids(scene, i), group = [p.binding, i, ...kids].filter((x) => x != null).sort((a, b) => a - b);
   const old = p.name, parts = [];
   for (const k of group) {
     const r = scene.recs[k], bytes = res.slice(r.off, r.end), dv = be(bytes);
     if (r.kind === KIND.BINDING) {
-      // full-name hashes: "<old>/..." -> "<new>/..."
       const full = new Map(); full.set(nlHash(old + '/root object01'), nlHash(newName + '/root object01'));
-      for (const c of allKids(scene, i)) { const n = scene.recs[c].name; if (n) full.set(scene.recs[c].hash, nlHash(newName + n.slice(old.length))); }
+      for (const c of kids) { const n = scene.recs[c].name; if (n) full.set(scene.recs[c].hash, nlHash(newName + n.slice(old.length))); }
       for (let o = 16; o + 4 <= bytes.length; o += 4) { const v = dv.getUint32(o); if (full.has(v)) dv.setUint32(o, full.get(v)); }
     } else {
-      const n = k === i ? newName : newName + r.name.slice(old.length);
-      dv.setUint32(4, nlHash(n));
+      dv.setUint32(4, nlHash(k === i ? newName : newName + r.name.slice(old.length)));
       if (k === i) for (let q = 0; q < 16; q++) dv.setFloat32(32 + 4 * q, m[q]);
     }
     parts.push(bytes);
   }
-  const add = parts.reduce((s, b) => s + b.length, 0);
-  const { loc } = scene; if (!loc.last) throw new Error("This stadium's object list isn't at the end of its file; copying isn't supported here.");
-  // insert after the last record of the group
-  const at = scene.recs[group[group.length - 1]].end;
+  const names = [newName, ...kids.map((c) => scene.recs[c].name).filter(Boolean).map((n) => newName + n.slice(old.length))];
+  return { parts, count: group.length, names, after: scene.recs[group[group.length - 1]].end };
+}
+// insert records into the object list at byte offset `at` (default: its end)
+export function insertRecords(res, scene, parts, count, at = scene.loc.end) {
+  const add = parts.reduce((s, b) => s + b.length, 0), { loc } = scene;
   const out = new Uint8Array(res.length + add);
   out.set(res.subarray(0, at), 0); let o = at; for (const b of parts) { out.set(b, o); o += b.length; } out.set(res.subarray(at), o);
   const dv = be(out);
-  dv.setUint32(loc.start, scene.count + group.length);
-  dv.setUint32(loc.idOff + 4, dv.getUint32(loc.idOff + 4) + add);
+  dv.setUint32(loc.start, scene.count + count);
+  dv.setUint32(loc.idOff + 4, dv.getUint32(loc.idOff + 4) + add);   // records are whole 16s, so chunks after it stay aligned
   dv.setUint32(4, dv.getUint32(4) + add);
   return out;
+}
+// copy a prop within its stadium: -> a new, longer res
+export function copyProp(res, scene, i, newName, m) {
+  const g = propRecords(res, scene, i, newName, m);
+  return insertRecords(res, scene, g.parts, g.count, g.after);
 }
 function allKids(scene, i) { const out = []; const go = (j) => { for (const k of scene.recs[j].kids || []) { out.push(k); go(k); } }; go(i); return out; }
 // a free name like sign_proxy22
@@ -127,4 +131,38 @@ export function freeName(scene, base) {
   const stem = base.replace(/\d+$/, ''), w = (base.match(/\d+$/) || ['00'])[0].length, used = new Set(scene.recs.map((r) => r.hash));
   for (let n = 1; n < 1000; n++) { const s = stem + String(n).padStart(w, '0'); if (!used.has(nlHash(s))) return s; }
   throw new Error('no free name');
+}
+// take a prop (its binding, the prop, its children) out of the object list: -> a new, shorter res
+export function removeProp(res, scene, i) {
+  const p = scene.recs[i]; if (p.kind !== KIND.PROXY) throw new Error('Only props can be removed.');
+  const group = [p.binding, i, ...allKids(scene, i)].filter((x) => x != null).sort((a, b) => b - a);
+  let out = res, removed = 0;
+  for (const k of group) {
+    const r = scene.recs[k], n = r.end - r.off, o = new Uint8Array(out.length - n);
+    o.set(out.subarray(0, r.off), 0); o.set(out.subarray(r.end), r.off); out = o; removed += n;
+  }
+  const dv = be(out), { loc } = scene;
+  dv.setUint32(loc.start, scene.count - group.length);
+  dv.setUint32(loc.idOff + 4, dv.getUint32(loc.idOff + 4) - removed);
+  dv.setUint32(4, dv.getUint32(4) - removed);
+  return out;
+}
+// take several props out at once (each with its binding and children): -> a new, shorter res
+export function removeProps(res, scene, list) {
+  const all = new Set();
+  for (const i of list) {
+    const p = scene.recs[i]; if (!p || p.kind !== KIND.PROXY) throw new Error('Only props can be removed.');
+    for (const k of [p.binding, i, ...allKids(scene, i)]) if (k != null) all.add(k);
+  }
+  const group = [...all].sort((a, b) => b - a);
+  let out = res, removed = 0;
+  for (const k of group) {
+    const r = scene.recs[k], n = r.end - r.off, o = new Uint8Array(out.length - n);
+    o.set(out.subarray(0, r.off), 0); o.set(out.subarray(r.end), r.off); out = o; removed += n;
+  }
+  const dv = be(out), { loc } = scene;
+  dv.setUint32(loc.start, scene.count - group.length);
+  dv.setUint32(loc.idOff + 4, dv.getUint32(loc.idOff + 4) - removed);
+  dv.setUint32(4, dv.getUint32(4) - removed);
+  return out;
 }

@@ -16,7 +16,8 @@ in your browser, with nothing to install, and it never changes your game files.
 | --- | --- |
 | **Stadium** | numbers, the stadium's moving parts (flags, signs, the field generator, flying cameras, blimps, the riot guards...), whether it has a goal event, **Export stadium (.glb)** |
 | **Textures** | **the pitch as one picture** (download, paint, put back), every texture with **Replace…**, the animated pictures (the big screens, the captain's face) and their frames |
-| **Objects** | everything placed in the stadium: props (signs, small flags, foam fingers, field generators, flying cameras…), big-flag spots, crowd spots, riot-guard spots and effects. Click one (in the list or the 3D view), then move it (x along the pitch, y across, z up, in metres) or turn it. **Copy this prop** adds another of the same kind. **Markers** shows the points. |
+| **Stadium: Remodel it in Blender** | **Export stadium (.glb)**, change it in Blender, **Bring it back (.glb)**: the stadium's model is replaced by yours (see below). A meter shows the stadium's size against the biggest one in the game. |
+| **Objects** | everything placed in the stadium: props (signs, small flags, foam fingers, field generators, flying cameras…), big-flag spots, crowd spots, riot-guard spots and effects. Click one (in the list or the 3D view), then move it (x along the pitch, y across, z up, in metres) or turn it. **Copy this prop** adds another of the same kind; **Remove** takes one out. **Add a prop from any stadium** brings a prop kind in from another stadium. **Markers** shows the points. Many at once: **Select all** (a group or one kind of prop), **Ctrl+click**, or **Shift+drag** a box in the 3D view. Drag a selected object in the 3D view to move the selection along the ground (**Alt+drag** for height; **Snap** for 0.5 m and 15° steps); the sliders move, turn (round their middle) and **spread** them (away from or towards the centre spot) from where they were when selected. **Sit on the stadium** drops each one onto the first floor below it. Keys: arrows nudge (along the game's nearest axis to where the camera looks), PgUp/PgDn height, Q/E turn, Del remove, Ctrl+D copy, Ctrl+Z / Ctrl+Y undo and redo. Only props can be removed: the game expects its crowd, flag and riot-guard spots. |
 | **Settings** | the stadium's fog (shown in the 3D view), the light colour on the players, glow, player shadows, how the crowd is packed, and **the pitch**: running speed, slipperiness, ball drag and bounce. The whole settings file is there too, for anything else. |
 | **Fans** | each team's crowd list: tick which fans cheer for them (up to 8 kinds), and watch each fan's two animations: **Watching** and **Goal!** |
 | **Mod** | **Download mod pack (.zip)**: unzip into `%LOCALAPPDATA%\MSCRecomp\Riivolution`, turn it on in F10 > Mods, restart. One pack holds every change. |
@@ -53,6 +54,41 @@ the pitch, so they're most likely where the fans go; moving one is still to try 
 names (`sign_proxy22`), so the game sees a new object of the same kind. The physics planes
 (`phyplaneNN`, the invisible walls in some stadiums) are in the list too, not shown yet.
 
+**Props from other stadiums.** A prop kind is: its model or models (in `gameworld.tmp`, found
+through the object hashes its pieces use), the textures those models mention (and an animated
+texture's frames), its skeleton and its two animations (`idle` and one named after it, in
+`gameworld.res`), and its records in the object list. Adding one copies what the stadium doesn't
+already have: models and skeletons are skipped when one with the same id or name is there. The
+texture list is rewritten the way the game writes it: its directory sorted by hash, each picture
+on a multiple of 32 bytes, and each entry's fourth word the padding after its picture. (This
+writer gives back every stadium's list byte for byte; repainting now uses it too.) New skeletons
+and animations go at the end of `gameworld.res`, so nothing already there moves.
+
+**Opening a mod again.** A pack from this app also carries `<mod>/stadium-studio.json`, outside
+the files the game reads: the mod's name and the names of copied or added props (the game's name
+list doesn't have them). Without it, the names are worked out from the props' kinds.
+
+**Remodelling in Blender.** The stadium's model (model 0 of `gameworld.tmp`) is a list of pieces
+(packets: strips of vertices with a shader and its settings), grouped in objects, each object placed
+by a record in the object list. Bringing a .glb back:
+- a piece exported by the studio (`m0_pieceNNN`) that comes back where it was (to 2 cm) is copied as
+  the game had it: its shader (shine, reflections, the goals' look), settings and textures;
+- anything else is built new with the game's plain stadium shader `stadiumdiffuse` (one texture, the
+  baked light in the vertex colours; settings `tex, ffff0000, 0, 0, blend, ground, 1, 0, 0`):
+  smooth see-through materials (glTF BLEND) get an RGB5A3 texture and the blend flag, the rest CMPR;
+  materials named like ground/field/grass/floor/ice get the ground flag (it's on the game's pitch
+  tiles); vertices are kept under 1,500 per piece, like the game's own;
+- each new Blender object becomes one object of the model with its own record (its size and reach
+  worked out); records of objects that are gone come out. A piece named with "sky" is placed like
+  the stadium's own sky;
+- vertex colours from Wii games are usually stored at half brightness; when the new pieces' colours
+  are mostly below 0.56, they're doubled (Baked light: Automatic);
+- textures only the old pieces used are taken out; textures the props or the game's code use stay.
+
+The game's stadiums are 2.3 to 3.53 MB (`gameworld.tmp`, unpacked); the studio warns above 3.55 MB.
+The Palace exported and brought straight back gives both files byte for byte (tests/stadiumimport).
+**Not yet tried in the game.**
+
 **Goal events.** The Vice and The Wastelands have the riot guards: the goal transition where the
 machines come out is a cutscene (`vice_riotguard_home_0.nis`, `wastelands_riotguard_home_0.nis`),
 the stadium's `riotguard` prop, and the game's `CrowdRiot` code (found from the files and the
@@ -69,9 +105,12 @@ and the replay. The Vice's own crowd is a texture animation (four pictures, 0.1 
 - All 19 object lists read (one record for every object the file counts); a moved and a copied
   prop write back with every other object byte for byte the same; props show in the 3D view where
   the game places them.
-- A repainted pitch, a changed crowd list, changed settings and moved objects, packed as a mod. Settings files keep
-  every line you didn't change as it was. **Not yet tried in the game.**
+- **In the game: a copied prop works, and changed fans work.**
+- All 92 prop kinds in the 19 stadiums can be gathered for adding elsewhere; a Konga Coliseum
+  prop added to The Palace leaves both files readable.
+- A repainted pitch, changed settings, moved, removed and added objects, packed as a mod and opened
+  again. Settings files keep every line you didn't change as it was. These aren't tried in the
+  game yet.
 
-Not yet: removing objects, adding a prop the stadium doesn't already have, editing animations, bringing a remodelled
-stadium back from Blender. Some surfaces in The Vice show as flat brown sheets; in the game they may
+Not yet: editing animations. Some surfaces in The Vice show as flat brown sheets; in the game they may
 be see-through (that material flag isn't decoded yet).

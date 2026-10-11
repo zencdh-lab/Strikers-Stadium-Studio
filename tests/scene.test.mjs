@@ -24,3 +24,14 @@ for (const st of fs.readdirSync(G + 'Art/environments')) {
   n++;
 }
 console.log(`ok   ${n} stadium object lists read; moving and copying a prop keeps everything else`);
+// several props removed at once = one after the other
+{
+  const fs2 = await import('fs'); const { unpackZlib: unz } = await import('../src/stadium.js'); const sc = await import('../src/scene.js');
+  const res = unz(new Uint8Array(fs2.readFileSync((process.env.GAME || '') + '/Art/environments/thepalace/gameworld.res.zlib')));
+  const s0 = sc.parseScene(res), props = s0.recs.filter((r) => r.kind === sc.KIND.PROXY).slice(0, 3).map((r) => r.i);
+  const a = sc.removeProps(res, s0, props);
+  let b = res; for (const h of props.map((i) => s0.recs[i].hash)) { const s = sc.parseScene(b); b = sc.removeProp(b, s, s.recs.find((r) => r.hash === h && r.kind === sc.KIND.PROXY).i); }
+  if (a.length !== b.length || a.some((x, k) => x !== b[k])) throw new Error('removeProps differs from removing one by one');
+  if (sc.parseScene(a).recs.length !== sc.parseScene(a).count) throw new Error('removeProps: object count');
+  console.log('ok   3 props removed at once, the same as one by one');
+}

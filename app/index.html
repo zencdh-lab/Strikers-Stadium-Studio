@@ -121,12 +121,32 @@ ul.files { margin: 6px 0; padding-left: 18px; }
 .fan input { margin: 0; }
 .pitch img { width: 100%; border-radius: 8px; border: 1px solid var(--line); display: block; }
 .parts li { margin: 3px 0; }
+.meter { margin: 10px 0; }
+.meter .bar { height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; border: 1px solid var(--line); margin-top: 4px; }
+.meter .bar div { height: 100%; }
 .objlist { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 8px; }
 .objsub { width: 100%; font-size: 12.5px; color: var(--dim); margin-top: 6px; text-transform: capitalize; }
 button.obj { padding: 3px 8px; font-size: 12.5px; border-radius: 6px; }
 button.obj.on { border-color: #ffee00; color: #fff; }
 button.obj.changed { color: var(--text); }
 .box.sel { border-color: #6b6420; }
+.set3 { display: grid; grid-template-columns: 92px 1fr 74px; gap: 6px 8px; align-items: center; margin: 8px 0 4px; }
+.set3 label { color: var(--dim); font-size: 13px; }
+.set3 input[type=number] { width: 100%; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 4px 6px; color: inherit; }
+.set3 input[type=range] { width: 100%; }
+button.danger { border-color: #6b2a2a; }
+button.danger:hover:not(:disabled) { border-color: var(--bad); }
+button.selall { padding: 1px 7px; font-size: 11.5px; margin-left: 6px; vertical-align: 2px; font-weight: 400; }
+.objsub button.selall { text-transform: none; }
+.objtop { display: flex; gap: 6px; align-items: center; }
+.objtop input { flex: 1; min-width: 0; }
+.snap { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--dim); margin-top: 6px; }
+.keys { font-size: 12px; margin: 6px 0 0; }
+.box.tips { font-size: 13px; color: var(--dim); }
+.box.tips b { color: var(--text); }
+#selEditor { position: sticky; top: -14px; z-index: 4; background: var(--panel); padding-top: 1px; box-shadow: 0 6px 10px -8px #000; }
+#selEditor:empty { display: none; }
+.selrect { position: absolute; display: none; border: 1px dashed #ffee00; background: #ffee0018; pointer-events: none; z-index: 5; }
 </style>
 </head>
 <body>
@@ -148,7 +168,7 @@ button.obj.changed { color: var(--text); }
         <label><input type="checkbox" id="wire"> Wire</label>
         <label title="Crowd spots, flag spots and effects"><input type="checkbox" id="marks"> Markers</label>
       </div>
-      <div class="view" id="view"><div class="badge" id="badge" hidden></div><div class="hint">Drag to turn · scroll to zoom · right-drag to move</div></div>
+      <div class="view" id="view"><div class="badge" id="badge" hidden></div><div class="hint">Drag to turn · scroll to zoom · right-drag to pan · Shift+drag to select many</div></div>
       <div></div>
       <div class="welcome" id="welcome">
         <div class="card">
@@ -177,6 +197,8 @@ button.obj.changed { color: var(--text); }
   </div>
 </div>
 <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+<input type="file" id="packInput" accept=".zip" hidden>
+<input type="file" id="glbInput" accept=".glb" hidden>
 <input type="file" id="imgInput" accept="image/png,image/jpeg,image/webp" hidden>
 <div class="busy" id="busy"><div id="busyText">Working…</div></div>
 <div class="toast" id="toast"></div>
