@@ -1,0 +1,16 @@
+{
+  "name": "strikers-stadium-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A stadium editor for Mario Strikers Charged: repaint, fans, objects, settings, Riivolution mods.",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/stadium-app.js --bundle --format=iife --minify --target=es2020 --outfile=app/stadium.js --legal-comments=none",
+    "test": "node tests/ini.test.mjs && node tests/scene.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "fflate": "^0.8.2",
+    "three": "^0.160.0"
+  }
+}

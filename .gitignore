@@ -1,0 +1,33 @@
+node_modules/
+
+# Never commit game files or anything taken from them
+Art/
+ini/
+riivolution/
+Riivolution/
+*.dol
+*.rel
+*.thp
+*.rlg
+*.rlt
+*.nis
+*.sanim
+*.shier
+*.zlib
+*.resbun
+*.nlxwb
+*.iso
+*.rvz
+*.wbfs
+*.wia
+*.gcz
+*.nkit
+*.ciso
+*.gcm
+*.nfs
+*.wad
+hashid.bin
+
+# Things you download from the app
+*.glb
+*.zip
